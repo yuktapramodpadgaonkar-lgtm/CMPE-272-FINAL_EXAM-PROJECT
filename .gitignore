@@ -1,0 +1,16 @@
+# Large test artifacts
+test_4gb.bin
+smoke_*.bin
+received_*.bin
+*.partial
+*.tmp
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated credentials (regenerate locally)
+certs/*.pem
+certs/*.key
+!certs/README.md

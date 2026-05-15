@@ -1,0 +1,291 @@
+================================================================================
+CMPE 272 SECURE FILE TRANSFER — STEP-BY-STEP RUN GUIDE
+================================================================================
+This file lists steps in order. Paths assume you start at the project root:
+  CMPE-272-Final-Exam-Project\
+
+Use PowerShell unless noted. Do not commit the 4 GB test file.
+
+================================================================================
+PART 0 — PREREQUISITES
+================================================================================
+ 1. Install Python 3.11 or newer (python --version).
+ 2. Ensure ~5+ GB free disk space for the test file and received copies.
+ 3. Clone or copy this repository to your machine.
+
+================================================================================
+PART 1 — ONE-TIME SETUP (FRESH CLONE)
+================================================================================
+ 4. Open PowerShell and change directory to the project root:
+      cd path\to\CMPE-272-Final-Exam-Project
+
+ 5. Create a virtual environment:
+      python -m venv .venv
+
+ 6. Activate the virtual environment:
+      .\.venv\Scripts\Activate.ps1
+
+ 7. Install Python dependencies:
+      pip install -r requirements.txt
+
+ 8. Generate TLS/signing certificates (writes files under certs\):
+      python scripts\gen_certs.py
+
+ 9. Confirm these files exist (names may vary slightly; you need the PEM set):
+      certs\ca.pem
+      certs\receiver.pem
+      certs\receiver-key.pem
+      certs\sender.pem
+      certs\sender-key.pem
+
+================================================================================
+PART 2 — CREATE THE 4 GB TEST FILE (DO NOT COMMIT)
+================================================================================
+10. Still in project root with venv activated, create an all-zero 4 GB file:
+      python -c "open('test_4gb.bin','wb').write(b'\x00'*(4*1024*1024*1024))"
+
+    (This can take several minutes depending on disk speed.)
+
+11. Confirm the file size is 4,294,967,296 bytes (Explorer properties or):
+      (Get-Item test_4gb.bin).Length
+
+================================================================================
+PART 3 — RECORD THE SOURCE FILE SHA-256 (SENDER SIDE)
+================================================================================
+12. Hash the source file (streaming; safe for large files):
+      python scripts\sha256_stream.py test_4gb.bin
+
+13. Copy the printed hex string into your notes — you will compare after receive.
+
+    (Do not run verify_hashes against received_*.bin until that file exists after a transfer;
+     see steps 19 and 24.)
+
+    Alternative (loads entire file into memory; not ideal for 4 GB on low RAM):
+      python -c "import hashlib, pathlib; print(hashlib.sha256(pathlib.Path('test_4gb.bin').read_bytes()).hexdigest())"
+
+    Windows built-in:
+      certutil -hashfile test_4gb.bin SHA256
+
+================================================================================
+PART 4 — APPROACH A (mTLS) — DEFAULT PORT 5000
+================================================================================
+14. Open FIRST terminal (PowerShell), activate venv, go to project root:
+      cd path\to\CMPE-272-Final-Exam-Project
+      .\.venv\Scripts\Activate.ps1
+
+15. Start the Approach A receiver (listens on all interfaces, port 5000):
+      python approach-a-tls-mtls\receiver.py --port 5000 --output received_a.bin
+
+    Leave this running until the transfer finishes.
+
+    Implementation note (current code): after mTLS, the sender sends a signed file
+    manifest (FHDR002: size + SHA-256 + session binding + RSA-PSS signature using
+    sender-key.pem). Commands are unchanged; both sender and receiver load
+    approach-a-tls-mtls\manifest_crypto.py from the same folder.
+
+16. Open SECOND terminal, activate venv, same project root:
+      cd path\to\CMPE-272-Final-Exam-Project
+      .\.venv\Scripts\Activate.ps1
+
+17. Run the Approach A sender (connects to localhost, verifies server cert SAN):
+      python approach-a-tls-mtls\sender.py --port 5000 --file test_4gb.bin --server-name 127.0.0.1
+
+    Wait until the sender prints completion and throughput.
+
+18. In the receiver terminal, confirm you see a success line (receiver exits 0).
+
+19. Confirm hashes match (pick one):
+      python scripts\verify_hashes.py test_4gb.bin received_a.bin
+    Or manually: hash received file and compare to step 12:
+      python scripts\sha256_stream.py received_a.bin
+
+    Note: The receiver ALREADY verifies the full plaintext SHA-256 against the
+    digest in the signed manifest (inside the TLS tunnel). This step is an
+    independent double-check on disk for demos (source file vs received file).
+================================================================================
+PART 5 — APPROACH B (PLAIN TCP + APP AEAD) — DEFAULT PORT 5001
+================================================================================
+20. Open FIRST terminal, venv, project root:
+      cd path\to\CMPE-272-Final-Exam-Project
+      .\.venv\Scripts\Activate.ps1
+
+21. Start the Approach B receiver (port 5001 so it does not collide with A):
+      python approach-b-app-aead\receiver.py --port 5001 --output received_b.bin
+
+22. Open SECOND terminal, venv, project root.
+
+23. Run the Approach B sender:
+      python approach-b-app-aead\sender.py --port 5001 --file test_4gb.bin
+
+24. Confirm receiver success message; compare hashes (automated):
+      python scripts\verify_hashes.py test_4gb.bin received_b.bin
+
+    Or hash received file only and compare to step 12:
+      python scripts\sha256_stream.py received_b.bin
+
+    The receiver already verified against the sender's embedded hash; this is an extra check.
+================================================================================
+PART 6 — OPTIONAL FLAGS (CUSTOM HOST / CERT PATH)
+================================================================================
+25. Approach A sender — other host / TLS server name:
+      python approach-a-tls-mtls\sender.py --host YOUR_HOST --port 5000 --file test_4gb.bin --server-name NAME_ON_CERT
+
+26. Both approaches — non-default cert directory:
+      Add:  --certs-dir path\to\certs
+    to sender and receiver commands (same path for both ends).
+
+27. Approach B receiver — bind address:
+      python approach-b-app-aead\receiver.py --bind 0.0.0.0 --port 5001 --output received_b.bin
+
+28. Approach B sender — remote host:
+      python approach-b-app-aead\sender.py --host YOUR_HOST --port 5001 --file test_4gb.bin
+
+================================================================================
+PART 7 — RESUME AFTER INTERRUPT (SAME APPROACH, SAME PATHS)
+================================================================================
+29. Kill the sender mid-transfer (Task Manager or Ctrl+C on sender only).
+
+30. Run the receiver again with the SAME --output path as before.
+
+31. Run the sender again with the SAME --file.
+
+    Approach A: resume when .partial + .meta.json match expected_size,
+    expected_sha256, chunk_size, file_id, and prefix_sha256 over bytes already
+    on disk. After a clean disconnect, partials are usually kept; some errors
+    delete them (fail closed).
+
+    Approach B: resume when .partial + .meta.json match expected_size and
+    expected_sha256 from the new session metadata (re-reads partial to continue
+    hashing). Final SHA-256 still must match before install.
+
+32. After success, confirm hashes again (compare to the digest from step 12, or run):
+      python scripts\verify_hashes.py test_4gb.bin received_a.bin
+    For Approach B use received_b.bin instead of received_a.bin when you interrupted B.
+
+================================================================================
+PART 8 — FAILURE / RUBRIC CHECKS (RECOMMENDED)
+================================================================================
+33. Wrong certificate test: copy certs to a temp folder, replace sender-key.pem
+    with a different key (or wrong cert), point --certs-dir at that folder on
+    the sender only — handshake should fail; no valid received file.
+
+34. Tamper tests: Approach B — corrupt ciphertext or use a MITM; receiver should
+    error before final rename. Approach A — TLS should reject record tampering;
+    corrupting the .partial file should fail prefix_sha256 on resume or final
+    SHA-256 at end (partial may be quarantined).
+
+35. Confirm partial outputs are NOT left as the final filename on verify fail:
+    Look for received_*.bin only after success; during transfer you may see
+    received_*.bin.partial and *.meta.json.
+
+================================================================================
+PART 9 — SUBMISSION ARTIFACTS (YOUR COURSE CHECKLIST)
+================================================================================
+36. Update AI_NOTES.md with your real run dates, hashes, and AI usage.
+
+37. Record your 2–3 minute demo (both approaches, 4 GB, hash verification).
+
+38. Do not add test_4gb.bin or received_*.bin to git (see .gitignore).
+
+================================================================================
+PART 10 — DEMO: WHAT EACH STEP DOES, WHAT TO SAY, AND CIAA (EASY WORDS)
+================================================================================
+Use this while recording. "You" = narrator. Steps match PART 0–9 above.
+
+--- Steps 1–3 (Part 0) — Prerequisites ---
+What it does: Confirms Python, disk space, and that you have the project.
+Say: "I'm on Python 3.11-plus with enough disk for a 4 gigabyte test file and a
+     copy of the project. The wire is treated as hostile; we're not trusting the network."
+CIAA: Sets up **Availability** (you can actually finish the demo) and honesty
+     about constraints; no crypto yet.
+
+--- Steps 4–9 (Part 1) — One-time setup ---
+What it does: venv, pip install, generate demo CA and sender/receiver certs under certs\.
+Say: "First I create a virtual environment and install the cryptography library.
+     Then I run gen_certs — that mints a tiny local Certificate Authority and two
+     identities: the receiver cert acts like the TLS server, the sender cert acts
+     like the TLS client. Both trust the same CA file — that's how we'll know we're
+     talking to the right program, not a random attacker."
+CIAA: **Authenticity** foundation (long-term keys bound to names in certs).
+     **Confidentiality** keys for TLS/session crypto come later from handshakes,
+     not from hard-coded secrets in source.
+
+--- Steps 10–11 (Part 2) — 4 GB test file ---
+What it does: Writes four billion zero bytes to test_4gb.bin; you confirm size.
+Say: "I'm generating a 4 GB file of zeros so we can stress streaming and hashing.
+     I am not committing secrets — this is just bulk data for the lab."
+CIAA: Supports **Availability** (realistic size); integrity story applies to whatever
+     bytes you send (zeros or random).
+
+--- Steps 12–13 (Part 3) — Hash the source ---
+What it does: SHA-256 of test_4gb.bin (streaming script); you save the hex digest.
+Say: "Before any transfer, I hash the source file with SHA-256. After the receive,
+     I'll show the same hash again — that's independent proof the file bit-for-bit
+     matches, not just 'the right number of bytes'."
+CIAA: **Integrity** (global file commitment). Works with **Authenticity** because
+     the sender later puts this digest in a signed manifest (A) or encrypted meta (B).
+
+--- Steps 14–19 (Part 4) — Approach A ---
+What it does: Receiver listens with mTLS; sender connects, TLS handshake, then signed
+     FHDR002 manifest, chunked file inside TLS, receiver hashes plaintext and renames
+     only if size and SHA-256 match.
+Say: "Approach A is mutual TLS. Nothing in our app protocol runs until both sides
+     prove their certificates to each other. After that tunnel exists, the sender
+     sends a signed opening message with file size and the expected SHA-256, then
+     streams one-megabyte chunks inside TLS. The receiver writes a temporary partial
+     file, updates checkpoints, and only installs the final file when the hash matches."
+CIAA:
+  C — **Confidentiality**: TLS encrypts what goes on the wire; attackers should see ciphertext.
+  I — **Integrity**: TLS record AEAD catches tampered ciphertext; end-to-end SHA-256
+       catches any wrong plaintext file at the end.
+  A — **Authenticity**: Mutual TLS certificates; manifest signed with sender key so
+       the promised hash is tied to the authenticated client.
+  A — **Availability**: TCP retries; chunked I/O; resume from .partial + meta after drops.
+
+--- Steps 20–24 (Part 5) — Approach B ---
+What it does: Plain TCP; X25519 + signed handshake with same certs; ChaCha20-Poly1305
+     per chunk; SHA-256 over full plaintext at end.
+Say: "Approach B deliberately does not wrap the file in TLS. We use raw TCP, then our
+     own handshake: ephemeral Diffie-Hellman for session keys and RSA-PSS signatures so
+     each side proves who they are. Each chunk is encrypted with ChaCha20-Poly1305 with
+     a fresh nonce. Same final rule: hash the whole plaintext before we call it done."
+CIAA:
+  C — **Confidentiality**: ChaCha20-Poly1305 on chunks; keys from fresh ECDH.
+  I — **Integrity**: AEAD tag per chunk; AAD binds offset and size; full-file SHA-256.
+  A — **Authenticity**: Cert-backed RSA-PSS on handshake transcripts.
+  A — **Availability**: Same chunking, checkpoints, resume story as A (meta details differ).
+
+--- Steps 25–28 (Part 6) — Optional flags ---
+What it does: Remote host, custom cert directory, bind address.
+Say: "If this were two VMs, I'd point the sender at the server's IP and set server-name
+     to whatever is on the certificate's subject alternative names. Both ends use the
+     same --certs-dir so they trust the same CA."
+CIAA: **Authenticity** still anchored to the same trust model; wrong host/name fails closed.
+
+--- Steps 29–32 (Part 7) — Resume ---
+What it does: Kill sender mid-flight; restart receiver then sender; partial may continue.
+Say: "I kill the sender to simulate a bad network. I restart the receiver with the same
+     output name, then the sender again. If the saved partial and metadata still match
+     this file's identity, we pick up where we left off instead of silently accepting a
+     half file as finished."
+CIAA: **Availability** (finish despite disruption). **Integrity / Authenticity**: resume
+     only when metadata matches (Approach A also checks prefix hash so a corrupted partial
+     is not blindly trusted).
+
+--- Steps 33–35 (Part 8) — Rubric checks ---
+What it does: Wrong key, tamper, confirm no fake final file on failure.
+Say: "For the grader: wrong certificate — handshake fails, no secret file. Tamper the
+     ciphertext in B or the wire in A — verification fails. On failure we never rename
+     a broken partial to the final filename."
+CIAA: **Authenticity** (wrong cert), **Integrity** (tamper), **Availability** framed as
+     fail-safe: we prefer no file over a wrong file.
+
+--- Steps 36–38 (Part 9) — Submission ---
+What it does: Fill AI notes, record demo, keep large binaries out of git.
+Say: "I document how I used AI, I record this walkthrough with the 4 GB hash check,
+     and I do not commit the huge test artifact to version control."
+CIAA: Academic integrity and reproducibility — not a crypto primitive, but part of the deliverable.
+
+================================================================================
+END OF STEP LIST
+================================================================================
