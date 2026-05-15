@@ -1,6 +1,6 @@
 # Secure 4 GB Transfer — Design (Both Approaches)
 
-This document satisfies the assessment requirement for architecture, algorithms, and an explicit **CIAA** mapping with a **row-per-threat** table for each approach.
+This file is the **single repo-root `DESIGN.md`** required by the assessment (**item 11**). It covers **both** approaches: ASCII architecture, key exchange / key management, chunking and framing, **exact algorithms and parameters**, and a **row-by-row threat model** aligned with the course threat table.
 
 ---
 
@@ -8,157 +8,180 @@ This document satisfies the assessment requirement for architecture, algorithms,
 
 | Item | Value | Rationale |
 |------|-------|-----------|
-| Chunk size | **1 MiB** (`1_048_576` bytes) | Keeps memory bounded while amortizing syscalls on Windows. |
-| Whole-file integrity | **SHA-256** over **plaintext** | Independent of transport AEAD; detects truncation/reordering bugs at the file layer. |
-| Mutual authentication | **RSA 2048** X.509 certs issued by a local demo **CA** (`scripts/gen_certs.py`) | Not a production PKI; demonstrates trust anchors and fail-closed verification. |
-| Fail-closed storage | Receiver writes **`*.partial`** + **`*.meta.json`**, verifies, then **rename** | Prevents a half-finished file from masquerading as the final object. |
+| Chunk size | **1 MiB** (`1_048_576` bytes) | Bounded memory; reasonable syscall rate on Windows. |
+| Whole-file integrity | **SHA-256** over **plaintext** | End-to-end commitment independent of per-chunk / per-record crypto. |
+| Identity / trust anchor | **RSA 2048-bit** X.509 certs, **SHA-256** cert signatures, demo **CA** (`scripts/gen_certs.py`) | Demonstrates mutual trust without building a PKI. |
+| Fail-closed storage | **`*.partial`** + **`*.meta.json`**, `fsync`, then **atomic install** to final path | No half file presented as complete. |
 
 ---
 
-## Approach A — mutually authenticated TLS (transport security)
+# Approach A — Mutually authenticated TLS (transport-layer security)
 
-### ASCII architecture
-
-```
-Sender (TLS client + sender.pem)                Receiver (TLS server + receiver.pem)
-        |                                                    |
-        |=========== TCP + TLS 1.2+ (AEAD records) =========>|
-        |   (ECDHE key exchange if negotiated; FS optional)  |
-        |                                                    |
-        |--- APP: MAGIC, FHDR002(signed manifest: size, sha256, nonce) -->|
-        |<-- APP: READY(nonce), GO/RESUME(offset) ----------|
-        |--- APP: CHNK*(plaintext) -------------------------->|
-        |--- APP: DONE ------------------------------------->|
-        |                                                    | verify SHA-256
-        |                                                    | rename -> final path
-```
-
-### Key exchange / trust
-
-1. **Trust anchor:** each side loads `certs/ca.pem`.
-2. **Server identity:** receiver presents `receiver.pem` (CN `file-transfer-receiver`, SAN `localhost` + `127.0.0.1`).
-3. **Client identity:** sender presents `sender.pem` (CN `file-transfer-sender`, EKU **clientAuth**).
-4. **Python `ssl`:** `CERT_REQUIRED` on both ends; **no** `check_hostname=False` shortcuts.
-5. **Session binding:** receiver sends random `server_nonce`; sender echoes it inside the signed manifest so an old manifest cannot be replayed against a fresh session without breaking TLS.
-6. **Manifest signature:** after mTLS, the sender sends `FHDR002` = `file_id` (16 B, `SHA256(digest||size)[:16]`) + size + SHA-256 digest + echoed nonce + **RSA-PSS-SHA256** signature over those bytes using **`sender-key.pem`**. The receiver verifies with the **client certificate public key** from `getpeercert(binary_form=True)`, binding the claimed file hash to the authenticated sender identity (not only TLS record protection).
-
-### Chunking / framing (inside TLS)
-
-| Frame | Bytes | Meaning |
-|-------|-------|---------|
-| `SECFTA1` | 7 | Magic |
-| `READY01` + 16 | 7+16 | Receiver random |
-| `FHDR002` + 16 `file_id` + u64 BE size + 32 digest + 16 echo + u32 siglen + RSA-PSS sig | | Signed file manifest (inside TLS) |
-| `GO00001`+u64 or `RESUM01`+u64 | | Start offset |
-| `CHNK001` + u32 BE len + plaintext | | Chunk |
-| `DONE001` | 7 | Sender finished sending declared size |
-
-### Algorithms (explicit)
-
-| Layer | Algorithm / mechanism | Parameters |
-|-------|----------------------|------------|
-| Transport | TLS 1.2+ with OpenSSL-backed AEAD suites (e.g., AES-GCM) | Negotiated; **minimum** TLS 1.2 |
-| Certificates | RSA 2048, SHA-256 signature on CSR | 2048-bit, SHA-256 |
-| File integrity | SHA-256 | 256-bit digest over plaintext stream |
-
-### CIAA mapping — Approach A
-
-| Property | Mechanism in this code |
-|----------|------------------------|
-| **C — Confidentiality** | TLS record encryption (AEAD). File bytes never leave the sender process in cleartext on the wire. |
-| **I — Integrity** | TLS record authentication **plus** independent SHA-256 over plaintext at receiver; `DONE` + size check. |
-| **A — Authenticity** | Mutual TLS: both parties present certs signed by the configured CA; wrong cert aborts handshake. |
-| **A — Availability** | TCP retransmissions; chunked I/O; **resume** using signed offsets is approximated via authenticated channel metadata (`RESUM01` + offset) with `.meta.json` checkpoints after `fsync`. |
-
-### Threat model table — Approach A
-
-| Threat | CIAA | How this design answers it (and where in code) |
-|--------|------|---------------------------------------------------|
-| Passive eavesdropper | C | TLS ciphertext; attacker learns timing/volume only. |
-| Active MITM modifies bytes | I | TLS AEAD rejects record tampering; even if broken, **SHA-256** over plaintext fails at finalize. |
-| Spoof sender/receiver | A | mTLS: peer cert must chain to `ca.pem` with expected CN. |
-| Replay of earlier transfer | I / A | Fresh TLS session + fresh `server_nonce` in signed manifest binds metadata to this session. |
-| Connection drop at 80% | A | Partial file not renamed; metadata tracks bytes; **resume** continues hashing by re-reading partial prefix then appending. |
-| Untrusted broker | n/a | Not used in Approach A. |
-
----
-
-## Approach B — application-layer AEAD on plain TCP
-
-### ASCII architecture
+## ASCII architecture diagram
 
 ```
-Sender                                    Receiver
-  | plain TCP                                |
-  |---- u32-len: ClientHandshake ----------->|
-  |<--- u32-len: ServerHandshake ------------|
-  |      (RSA-PSS signatures bind ephemera + randoms)        |
-  |                                            |
-  |== X25519 ECDH => HKDF-SHA256 keys ========|
-  |                                            |
-  |---- AEAD(meta) --------------------------->|
-  |<--- AEAD(GO|RS + offset) -------------------|
-  |---- AEAD(chunk_i) ----------------------->|
-  |                                            | verify tags + SHA-256
+  Sender (TLS client, sender.pem)                    Receiver (TLS server, receiver.pem)
+           |                                                    |
+           |==== TCP + TLS 1.2+ (ECDHE optional; AEAD records) ==|
+           |                                                    |
+           |--- APP: SECFTA1 ---------------------------------->|
+           |<-- APP: READY01 || server_nonce (16 B) ------------|
+           |--- APP: FHDR002 || signed manifest ---------------->|
+           |       (file_id, size, SHA-256, echo nonce, RSA-PSS)|
+           |<-- APP: GO00001||u64 OR RESUM01||u64 offset --------|
+           |--- APP: CHNK001||u32 len|| plaintext -------------->|
+           |        ... repeat while bytes < total_size ...      |
+           |--- APP: DONE001 ----------------------------------->|
+           |                                                    |
+           |                              stream hash(plaintext)|
+           |                              if size+SHA-256 OK:  |
+           |                              partial -> temp ->  |
+           |                              rename received file  |
 ```
 
-### Key exchange / trust
+## Key exchange / key management
 
-1. Each side loads long-term **RSA** cert + key (`sender.pem` / `receiver.pem`) trusted via `ca.pem`.
-2. **Ephemeral X25519** keys per session (`X25519PrivateKey.generate()`).
-3. **RSA-PSS-SHA256** signatures cover transcript bytes that include both random nonces and ephemeral public keys — mutual authentication without TLS.
-4. **HKDF-SHA256** (`cryptography` HKDF) derives separate symmetric keys for **control/meta** (`info=b"meta"`) and **payload** (`info=b"payload"`).
-5. **Session binding digest** `SHA256(client_random||server_random)[:16]` is included inside AEAD-protected metadata so a metadata blob cannot be cut-and-pasted across sessions.
+| Step | Mechanism |
+|------|-----------|
+| Long-term keys | **RSA 2048** key pairs in `sender-key.pem`, `receiver-key.pem`; certs signed by **CA** (`ca.pem`). |
+| Transport keys | **TLS 1.2+** handshake; typically **ECDHE** ephemeral key exchange (if negotiated by stack) for session keys; **AEAD** for application data records (suite negotiated by OpenSSL / platform). |
+| Trust | Server presents `receiver.pem`; client presents `sender.pem`; **`ssl.CERT_REQUIRED`**; client **`check_hostname=True`** against SAN (`localhost`, `127.0.0.1`). |
+| File commitment | After TLS is live, **`FHDR002`**: 16-byte **`file_id = SHA256(digest \|\| BE64(size))[:16]`**, **64-bit BE file size**, **32-byte SHA-256 digest**, **16-byte echoed `server_nonce`**, **RSA-PSS-SHA256** signature over `file_id \|\| size \|\| digest \|\| echo` using **`sender-key.pem`**. Receiver verifies signature with **mTLS client public key** from `SSLSocket.get_peercert(binary_form=True)`. |
 
-### Chunking / framing
+## Chunking and framing (application bytes, inside TLS ciphertext on the wire)
 
-- All payloads after the handshake are **`u32_be_length || bytes`**.
-- **Metadata** (nonce index `1`, key `k_meta`): `size_u64_be || sha256 || bind16` with AAD `META/1`.
-- **Control** (nonce index `2`): `GO` + `0` offset or `RS` + `u64` offset with AAD `SCTRL/1`.
-- **Data chunks** (nonce index `3 + seq`): ciphertext with AAD `DATA/1 || u64_current_offset || u64_total_size` to cryptographically bind each chunk to its logical position and file length (**reorder / truncate detection**).
+| On-the-wire sequence (plaintext view inside TLS) | Format |
+|---------------------------------------------------|--------|
+| Magic | `SECFTA1` (7 bytes) |
+| Ready | `READY01` (7) + `server_nonce` (16) |
+| Signed manifest | `FHDR002` (7) + `file_id` (16) + `size` (u64 BE) + `sha256_digest` (32) + `echo_nonce` (16) + `sig_len` (u32 BE) + **RSA-PSS-SHA256** signature |
+| Control | `GO00001` (7) + u64 BE (0 for fresh) **or** `RESUM01` (7) + u64 BE **resume offset** |
+| Data | Repeated: `CHNK001` (7) + u32 BE **chunk length** + **plaintext** (≤ 1 MiB) |
+| End | `DONE001` (7) |
 
-### Algorithms (explicit)
+Receiver updates **`SHA256(plaintext stream)`** incrementally; after `DONE`, requires **`received_bytes == size`** and **`digest == expected_digest`**.
 
-| Purpose | Algorithm | Parameters |
-|---------|-----------|------------|
-| Key agreement | **X25519** ECDH | 32-byte public keys (`Encoding.Raw`) |
-| KDF | **HKDF-SHA256** | 32-byte keys, `salt=b"cmpe272-approach-b"` |
-| AEAD | **ChaCha20-Poly1305** | 256-bit keys, **96-bit nonce** = `index.to_bytes(12,"big")` (monotonic per session) |
-| Handshake auth | **RSA-PSS** with **MGF1-SHA256** | MAX salt length |
-| Whole-file integrity | **SHA-256** over plaintext | Same as Approach A |
+## Exact algorithms and parameters — Approach A
 
-### Forward secrecy (explicit note)
+| Role | Algorithm / primitive | Parameters / notes |
+|------|------------------------|-------------------|
+| Transport protocol | **TLS** | **Minimum TLS 1.2** (`ssl.TLSVersion.TLSv1_2`); `PROTOCOL_TLS_CLIENT` / `PROTOCOL_TLS_SERVER`. |
+| Record protection | **TLS negotiated AEAD** (e.g. **AES-256-GCM** or ChaCha20-Poly1305 with typical modern stacks) | Not hard-coded in Python; chosen by OpenSSL/platform from enabled cipher suites. |
+| Certificate keys | **RSA 2048**, cert signed with **SHA-256** | `gen_certs.py`: public exponent **65537**. |
+| Certificate chain validation | **X.509**: issuer subject match + **RSASSA-PKCS1-v1_5** signature verification on `tbs_certificate_bytes` | Demo CA verifies child certs (`cryptography` patterns where applicable). |
+| Manifest signature | **RSA-PSS** with **MGF1-SHA256**, **SHA-256** message hash, **PSS MAX_LENGTH** salt | Signs the **56-byte** manifest prefix (`file_id` + size + digest + echo nonce). |
+| File integrity | **SHA-256** | **256-bit** digest over **entire plaintext file**; compared after transfer. |
 
-If a **long-term RSA private key** is compromised later, an attacker could forge future handshakes, but **past session X25519 ephemera** are not recoverable from those long-term keys alone. Therefore **past ciphertext confidentiality** enjoys a form of **forward secrecy** with respect to the signing keys, provided ephemeral private keys are zeroed after use (Python GC does not guarantee immediate erasure; production code would zeroize).
-
-### CIAA mapping — Approach B
+## CIAA — Approach A (summary)
 
 | Property | Mechanism |
 |----------|-----------|
-| **C** | ChaCha20-Poly1305 on every metadata/chunk; keys from fresh ECDH. |
-| **I** | AEAD tags per frame; AAD binds offset+total; SHA-256 over plaintext end-to-end. |
-| **A** | RSA certs verified to CA + RSA-PSS signatures over handshake transcripts. |
-| **A** | Same as Approach A: TCP + chunking + resume metadata + `fsync` checkpoints. |
+| **C — Confidentiality** | TLS encrypts application data on the wire. |
+| **I — Integrity** | TLS **AEAD** on records + **SHA-256** over full plaintext + size/`DONE` discipline. |
+| **A — Authenticity** | **Mutual TLS** + **RSA-PSS** on manifest binding digest to **authenticated client key**. |
+| **A — Availability** | **TCP** retransmits; **chunked** send/recv; **resume** via `.partial` + `.meta.json` (including **`prefix_sha256`** checkpoint in Approach A code); disconnect preserves partial for retry. |
 
-### Threat model table — Approach B
+## Threat model table — Approach A (row-by-row)
 
-| Threat | CIAA | How this design answers it |
-|--------|------|------------------------------|
-| Passive eavesdropper | C | Only ciphertext + ciphertext lengths on the wire; keys from ECDH. |
-| Active MITM modifies bytes | I | Poly1305 tag verification fails; chunk rejected. |
-| Spoof sender/receiver | A | Signature verification fails if attacker lacks private key matching enrolled cert. |
-| Replay of earlier transfer | I / A | New ECDH + new HKDF keys + binding digest in metadata. |
-| Connection drop at 80% | A | Same partial-file discipline as Approach A. |
-| Untrusted broker | n/a | Not implemented here; **Approach B is architecturally suitable** to stack atop dumb object storage because plaintext never touches the store if you encrypt client-side with per-object keys (out of scope for this repo). |
+Rows match the **course threat model**; each row states how Approach A addresses it.
+
+| Threat (as in assignment) | CIAA bucket | How Approach A satisfies “what you must show” |
+|----------------------------|-------------|-----------------------------------------------|
+| **Passive eavesdropper** records the entire TCP stream. | **Confidentiality** | File bytes cross the network as **TLS ciphertext**; ephemeral session keys are negotiated inside TLS; long-term **RSA private keys** are not sent on the wire. |
+| **Active man-in-the-middle** modifies bytes mid-flight. | **Integrity** | **TLS AEAD** rejects altered ciphertext for affected records; receiver **rejects** the transfer if the **end-to-end SHA-256** over plaintext does not match the **signed manifest** digest. |
+| **Attacker spoofs** the sender or the receiver. | **Authenticity** | **mTLS**: handshake fails without valid cert chain to **`ca.pem`** and expected **CN**; manifest signature fails without **`sender-key.pem`** matching the presented client cert. |
+| **Replay** of an earlier valid transfer. | **Integrity / Authenticity** | Each session uses a new **TLS** context and new **`server_nonce`** echoed inside the **signed manifest**; replaying an old manifest blob against a new session fails **nonce binding** and/or **TLS** session keys. |
+| **Connection drops** at 80% transferred. | **Availability** | Receiver does **not** rename to the final path until **size + SHA-256** succeed; **partial file + JSON metadata** allow **resume** when the client reconnects with the same file identity. |
+| **Untrusted intermediary** (broker / object store), if used. | **Confidentiality / Integrity** | **Not used** in this implementation. A broker would only ever see **TLS ciphertext** if traffic were relayed; plaintext would still not be entrusted to the broker by this design. |
 
 ---
 
-## Broker / storage extension (design note only)
+# Approach B — Application-layer AEAD on plain TCP
 
-To add a **malicious cloud bucket** while keeping CIAA:
+## ASCII architecture diagram
 
-1. Sender **encrypts** with AEAD (as in Approach B) **before** upload; uploads only `(nonce, ciphertext, AAD metadata)` plus a **signed manifest** (Ed25519 or RSA-PSS) listing chunk hashes/order.
-2. Receiver downloads, verifies manifest signature against sender cert, verifies each chunk AEAD, verifies whole-file SHA-256.
-3. The broker learns **ciphertext + traffic patterns** only.
+```
+  Sender                                              Receiver
+    |---- TCP connect --------------------------------->|
+    |---- u32 BE len || ClientHandshake blob --------->|
+    |<--- u32 BE len || ServerHandshake blob ----------|
+    |      (RSA-PSS over transcript incl. randoms + X25519 pub keys)   |
+    |                                                    |
+    |    ECDH: X25519(client_ephem) <-> X25519(server_ephem)          |
+    |    HKDF-SHA256 -> k_meta (32 B), k_payload (32 B)                 |
+    |                                                    |
+    |---- u32 BE len || AEAD_chacha(k_meta, nonce=1, meta) ----------->|
+    |<--- u32 BE len || AEAD_chacha(k_meta, nonce=2, GO|RS||offset) --|
+    |---- u32 BE len || AEAD_chacha(k_payload, nonce=3+i, chunk_i) --->|
+    |        ... until all plaintext bytes sent ...                    |
+    |                                                    | SHA-256 OK? |
+    |                                                    | rename out |
+```
 
-This demonstrates **defense against an untrusted intermediary** without trusting it for plaintext.
+## Key exchange / key management
+
+| Step | Mechanism |
+|------|-----------|
+| Long-term keys | Same **RSA 2048** PEM certs as Approach A (`sender`, `receiver`), verified against **`ca.pem`**. |
+| Ephemeral keys | Per connection: **`X25519PrivateKey.generate()`** on each side; 32-byte **raw** public keys in handshake blobs. |
+| Shared secret | **`X25519.exchange()`** → 32-byte shared bytes. |
+| Key derivation | **HKDF-SHA256**, `salt=b"cmpe272-approach-b"`, **`info=b"meta"`** → 32 B **`k_meta`**; **`info=b"payload"`** → 32 B **`k_file`**. |
+| Handshake integrity / auth | **RSA-PSS-SHA256** (MGF1-SHA256, MAX salt) over defined byte strings including **client_random**, **server_random**, and **ephemeral public keys**. |
+| Metadata binding | **`SHA256(client_random \|\| server_random)[:16]`** inside AEAD plaintext so metadata cannot be replayed across sessions. |
+
+## Chunking and framing
+
+| Phase | Framing |
+|-------|---------|
+| Handshake | **`u32 big-endian length`**, then **blob** (magic, version, randoms, cert PEM, signature …). |
+| Metadata | **`u32 BE length`**, then **ChaCha20-Poly1305** ciphertext; **nonce** = `nonce_for_index(1)`; **AAD** = `META/1`; plaintext = **`u64 BE size` \|\| 32 B digest \|\| 16 B bind`**. |
+| Resume control | **`u32 BE length`**, AEAD with **nonce 2**, **AAD** `SCTRL/1`; plaintext **`GO` + u64** or **`RS` + u64 offset**. |
+| File chunks | **`u32 BE length`**, AEAD with **nonce `3 + seq`** (monotonic **96-bit** big-endian integer); **AAD** = `DATA/1` \|\| **`u64 BE byte offset`** \|\| **`u64 BE total_size`**; plaintext = up to **1 MiB** file slice. |
+
+## Exact algorithms and parameters — Approach B
+
+| Role | Algorithm / primitive | Parameters / notes |
+|------|------------------------|-------------------|
+| Key agreement | **X25519** (RFC 7748) | 32-byte **encoded** public keys (`Encoding.Raw`). |
+| KDF | **HKDF-SHA256** | Output **32 bytes** per label; **salt** fixed string `cmpe272-approach-b`. |
+| Symmetric AEAD | **ChaCha20-Poly1305** | **256-bit** keys; **96-bit nonce** = `index.to_bytes(12, "big")`; unique **index** per AEAD operation in a session. |
+| Handshake signatures | **RSA-PSS-SHA256**, **MGF1-SHA256**, **PSS MAX_LENGTH** salt | Same RSA **2048-bit** keys as certs. |
+| Certificate validation | **X.509** child-to-CA | Issuer match + **PKCS#1 v1.5** signature verification on **`tbs_certificate_bytes`** with CA public key (`cryptography`). |
+| File integrity | **SHA-256** | **256-bit** digest over **entire decrypted plaintext** stream. |
+
+## CIAA — Approach B (summary)
+
+| Property | Mechanism |
+|----------|-----------|
+| **C** | **ChaCha20-Poly1305** on metadata and chunks; keys from **fresh ECDH** each session. |
+| **I** | **Poly1305** tags + **AAD** binds chunk offset and total size; **SHA-256** over full plaintext. |
+| **A** | **RSA-PSS** handshake signatures + **X.509** mutual identification to **CA**. |
+| **A** | **TCP** + chunked I/O + **partial + meta** resume (metadata fields as implemented in `approach-b-app-aead/receiver.py`). |
+
+## Threat model table — Approach B (row-by-row)
+
+| Threat (as in assignment) | CIAA bucket | How Approach B satisfies “what you must show” |
+|----------------------------|-------------|-----------------------------------------------|
+| **Passive eavesdropper** records the entire TCP stream. | **Confidentiality** | File appears as **ChaCha20-Poly1305 ciphertext** and handshake components that do not disclose long-term private keys; **session keys** derive from **X25519** shared secret. |
+| **Active man-in-the-middle** modifies bytes mid-flight. | **Integrity** | **AEAD decrypt** fails (bad tag) for tampered ciphertext; wrong plaintext will fail final **SHA-256** vs metadata digest. |
+| **Attacker spoofs** the sender or the receiver. | **Authenticity** | **RSA-PSS** verification fails without the correct **private key** matching the peer’s **cert**; **CA**-pinned chain rejects forged certs. |
+| **Replay** of an earlier valid transfer. | **Integrity / Authenticity** | New **X25519** ephemera → new **HKDF** keys; **binding digest** in metadata ties ciphertext to this session’s randoms. |
+| **Connection drops** at 80% transferred. | **Availability** | Receiver does not install final output until completion and **SHA-256** match; **partial + meta** support resuming when metadata still matches the new session’s announced digest/size. |
+| **Untrusted intermediary** (broker / object store), if used. | **Confidentiality / Integrity** | **Not implemented** as a separate hop in this repo. The design **fits** “encrypt client-side, upload ciphertext + signed manifest only”: broker never receives **plaintext** or **long-term symmetric keys** if that pattern were added. |
+
+---
+
+## Broker extension (design note only — optional stretch)
+
+1. AEAD-encrypt chunks **before** upload; store only ciphertext + per-chunk nonces + **signed manifest** (chunk order, total size, **SHA-256**).
+2. Receiver verifies **manifest signature**, each **AEAD** tag, then **whole-file SHA-256**.
+3. Broker compromise yields **ciphertext** and **traffic metadata** only, not plaintext.
+
+---
+
+## Document map (assessment alignment)
+
+| Assessment reference | File |
+|----------------------|------|
+| **Item 10** — install, 4 GB generation, exact end-to-end commands | **`README.md`** (this repo’s root) |
+| **Item 11** — architecture, keys, framing, algorithms, threat tables **per approach** | **`DESIGN.md`** (this file; both approaches) |
